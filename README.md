@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # SentinelX SOAR
 
 ### Automated Threat Intelligence and Incident Response Platform
@@ -194,3 +195,7 @@ Reduces manual triage effort by automating repetitive security operations tasks.
 Yashwanth
 
 Cybersecurity Engineering Project – SentinelX SOAR
+=======
+# soar-incident-containment-engine
+SentinelX SOAR: Automated Threat Intelligence and Incident Response Platform
+>>>>>>> 13d9574e15091fcfe203ab8f6c3a910b6e8c00cc

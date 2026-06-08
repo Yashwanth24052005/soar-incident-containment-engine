@@ -1,7 +1,4 @@
-<<<<<<< HEAD
-# SentinelX SOAR
-
-### Automated Threat Intelligence and Incident Response Platform
+# SentinelX SOAR-Automated Threat Intelligence and Incident Response Platform
 
 SentinelX SOAR is an enterprise-grade Security Orchestration, Automation, and Response (SOAR) platform designed to automate the complete incident response lifecycle—from security alert ingestion and threat intelligence enrichment to automated containment and analyst-driven investigation workflows.
 
@@ -13,7 +10,7 @@ Built as part of an advanced cybersecurity engineering project, SentinelX SOAR d
 ---
 ## 🏗️ System Architecture
 
-```text
+```
                                     ┌─────────────────────┐
                                     │      SIEM / IDS     │
                                     │ Splunk | QRadar     │
@@ -69,7 +66,7 @@ Built as part of an advanced cybersecurity engineering project, SentinelX SOAR d
 ```
 ## 🔄 Incident Response Workflow
 
-```text
+```
 Alert Generated
       │
       ▼
@@ -198,4 +195,4 @@ Cybersecurity Engineering Project – SentinelX SOAR
 =======
 # soar-incident-containment-engine
 SentinelX SOAR: Automated Threat Intelligence and Incident Response Platform
->>>>>>> 13d9574e15091fcfe203ab8f6c3a910b6e8c00cc
+

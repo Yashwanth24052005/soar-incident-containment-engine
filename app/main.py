@@ -10,11 +10,9 @@ import uvicorn
 import logging
 
 from app.routers import alerts
+from app.logger import setup_logging
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s - %(message)s"
-)
+setup_logging(level="INFO")
 logger = logging.getLogger("soar.main")
 
 # ─── Swagger UI metadata ──────────────────────────────────────────────────────

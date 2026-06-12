@@ -11,6 +11,7 @@ import logging
 
 from app.routers import alerts
 from app.logger import setup_logging
+from app.middleware import RequestLoggingMiddleware
 
 setup_logging(level="INFO")
 logger = logging.getLogger("soar.main")
@@ -92,6 +93,7 @@ app = FastAPI(
     },
 )
 
+app.add_middleware(RequestLoggingMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],

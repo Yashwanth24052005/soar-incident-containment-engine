@@ -1,79 +1,38 @@
-"""
-Alerts Router - Webhook ingestion endpoint
-Receives raw SIEM alerts, normalizes them, stores in memory for now (Week 2 will add DB)
-"""
+# ─── Week 2 Day 2: VirusTotal Hash Lookup ────────────────────────────────────
 
-import logging
-from fastapi import APIRouter, HTTPException, status
-from typing import List
-
-from app.models.alert import RawSIEMAlert, NormalizedAlert, AlertResponse
-from app.normalizer import normalize_alert
-
-logger = logging.getLogger("soar.alerts")
-router = APIRouter()
-
-# In-memory store for Week 1 (replaced with DB in Week 2)
-_alert_store: List[NormalizedAlert] = []
-
+from app.virustotal import lookup_hash, HashReputation
 
 @router.post(
-    "/alerts/ingest",
-    response_model=AlertResponse,
-    status_code=status.HTTP_201_CREATED,
-    summary="Ingest raw SIEM webhook alert"
+    "/alerts/{alert_id}/scan-hash",
+    response_model=HashReputation,
+    summary="Scan alert file hash against VirusTotal"
 )
-async def ingest_alert(payload: RawSIEMAlert):
+async def scan_hash_endpoint(alert_id: str):
     """
-    Accepts a raw SIEM webhook payload in any format.
-    Normalizes it into the standard schema and stores it.
-    This endpoint acts as the SOAR listener.
+    Queries VirusTotal for the reputation of the file hash in a malware alert.
+    Returns detection ratio, threat label, and risk level.
+    Requires VIRUSTOTAL_API_KEY to be set in the .env file.
+    Only works for alerts that contain a file_hash field.
     """
-    try:
-        normalized = normalize_alert(payload)
-        _alert_store.append(normalized)
-
-        logger.info(
-            f"Alert ingested: {normalized.alert_id} | "
-            f"{normalized.attack_type.value} | {normalized.severity.value}"
-        )
-
-        return AlertResponse(
-            success=True,
-            message=f"Alert ingested and normalized successfully.",
-            alert_id=normalized.alert_id,
-            normalized_alert=normalized
-        )
-
-    except Exception as e:
-        logger.error(f"Failed to normalize alert: {e}")
+    alert = alert_store.get_by_id(alert_id)
+    if not alert:
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=f"Alert normalization failed: {str(e)}"
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Alert '{alert_id}' not found."
         )
 
+    if not alert.file_hash:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Alert '{alert_id}' does not contain a file hash. Only malware alerts have hashes."
+        )
 
-@router.get(
-    "/alerts",
-    response_model=List[NormalizedAlert],
-    summary="List all ingested and normalized alerts"
-)
-async def list_alerts():
-    """Returns all normalized alerts ingested so far (in-memory, resets on restart)."""
-    return _alert_store
+    result = await lookup_hash(alert.file_hash)
 
+    if not result:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="VirusTotal lookup failed. Check your API key in .env file."
+        )
 
-@router.get(
-    "/alerts/{alert_id}",
-    response_model=NormalizedAlert,
-    summary="Get a specific normalized alert by ID"
-)
-async def get_alert(alert_id: str):
-    """Fetch a specific alert by its ID."""
-    for alert in _alert_store:
-        if alert.alert_id == alert_id:
-            return alert
-    raise HTTPException(
-        status_code=status.HTTP_404_NOT_FOUND,
-        detail=f"Alert '{alert_id}' not found."
-    )
+    return result

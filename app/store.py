@@ -7,8 +7,10 @@ Alerts are saved to data/alerts.json on every write.
 import json
 import logging
 import os
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Dict
+from enum import Enum
 
 from app.models.alert import NormalizedAlert
 
@@ -52,6 +54,37 @@ def _save_to_disk(alerts: List[NormalizedAlert]) -> None:
             temp_file.unlink()
 
 
+# ─── Alert Status Tracking ────────────────────────────────────────────────────
+
+class AlertStatus(str, Enum):
+    NEW = "new"
+    INVESTIGATING = "investigating"
+    CONTAINED = "contained"
+    RESOLVED = "resolved"
+    FALSE_POSITIVE = "false_positive"
+
+
+# Status store: {alert_id: status}
+_status_store: Dict[str, str] = {}
+
+
+def get_alert_status(alert_id: str) -> str:
+    return _status_store.get(alert_id, AlertStatus.NEW)
+
+
+def update_alert_status(alert_id: str, new_status: str) -> bool:
+    if new_status not in [s.value for s in AlertStatus]:
+        return False
+    _status_store[alert_id] = new_status
+    return True
+
+
+def get_all_statuses() -> Dict[str, str]:
+    return dict(_status_store)
+
+
+# ─── Alert Store class ────────────────────────────────────────────────────────
+
 class AlertStore:
     def __init__(self):
         self._alerts: List[NormalizedAlert] = _load_from_disk()
@@ -82,7 +115,12 @@ class AlertStore:
 
     def stats(self) -> dict:
         if not self._alerts:
-            return {"total_ingested": 0, "total_rejected": self._rejected_count, "by_severity": {}, "by_attack_type": {}}
+            return {
+                "total_ingested": 0,
+                "total_rejected": self._rejected_count,
+                "by_severity": {},
+                "by_attack_type": {},
+            }
         by_severity = {}
         by_attack_type = {}
         for alert in self._alerts:
@@ -90,10 +128,16 @@ class AlertStore:
             atk = alert.attack_type.value
             by_severity[sev] = by_severity.get(sev, 0) + 1
             by_attack_type[atk] = by_attack_type.get(atk, 0) + 1
-        return {"total_ingested": len(self._alerts), "total_rejected": self._rejected_count, "by_severity": by_severity, "by_attack_type": by_attack_type}
+        return {
+            "total_ingested": len(self._alerts),
+            "total_rejected": self._rejected_count,
+            "by_severity": by_severity,
+            "by_attack_type": by_attack_type,
+        }
 
     def increment_rejected(self) -> None:
         self._rejected_count += 1
 
 
+# ─── Singleton instance ───────────────────────────────────────────────────────
 alert_store = AlertStore()

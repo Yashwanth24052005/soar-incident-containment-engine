@@ -1,11 +1,12 @@
 """
 Alerts Router - Webhook ingestion endpoint
 Receives raw SIEM alerts, normalizes them, and persists them via AlertStore.
+Auto-enrichment runs in the background after every ingestion.
 """
 
 import logging
 import asyncio
-from fastapi import APIRouter, HTTPException, status, Query
+from fastapi import APIRouter, HTTPException, status, Query, BackgroundTasks
 from typing import List, Optional
 
 from app.models.alert import RawSIEMAlert, NormalizedAlert, AlertResponse, AttackType, SeverityLevel
@@ -14,16 +15,13 @@ from app.store import alert_store
 from app.enricher import enrich_alert, EnrichedAlert
 from app.virustotal import lookup_hash, HashReputation
 from app.risk_scorer import calculate_composite_score, CompositeRiskScore
+from app.background import auto_enrich_alert
 
 logger = logging.getLogger("soar.alerts")
 router = APIRouter()
 
 
 def _validate_payload(payload: RawSIEMAlert) -> None:
-    """
-    Validates the incoming SIEM payload before normalization.
-    Raises HTTPException if the payload is missing critical fields.
-    """
     has_ip = any([payload.src_ip, payload.source_ip, payload.sourceIPAddress])
     if not has_ip:
         raise HTTPException(
@@ -44,10 +42,11 @@ def _validate_payload(payload: RawSIEMAlert) -> None:
     status_code=status.HTTP_201_CREATED,
     summary="Ingest raw SIEM webhook alert"
 )
-async def ingest_alert(payload: RawSIEMAlert):
+async def ingest_alert(payload: RawSIEMAlert, background_tasks: BackgroundTasks):
     """
     Accepts a raw SIEM webhook payload in any format.
     Validates, normalizes, persists to disk, and returns the normalized alert.
+    Automatically triggers threat enrichment in the background.
     """
     try:
         _validate_payload(payload)
@@ -60,16 +59,25 @@ async def ingest_alert(payload: RawSIEMAlert):
         normalized = normalize_alert(payload)
         alert_store.add(normalized)
 
+        # Trigger background enrichment without blocking the response
+        background_tasks.add_task(
+            auto_enrich_alert,
+            alert_id=normalized.alert_id,
+            source_ip=normalized.source_ip,
+            file_hash=normalized.file_hash,
+        )
+
         logger.info(
             f"[INGESTED] alert_id={normalized.alert_id} | "
             f"type={normalized.attack_type.value} | "
             f"severity={normalized.severity.value} | "
-            f"src={normalized.source_ip}"
+            f"src={normalized.source_ip} | "
+            f"background_enrichment=queued"
         )
 
         return AlertResponse(
             success=True,
-            message="Alert ingested, normalized, and persisted successfully.",
+            message="Alert ingested and normalized. Threat enrichment running in background.",
             alert_id=normalized.alert_id,
             normalized_alert=normalized
         )
@@ -143,7 +151,6 @@ async def enrich_alert_endpoint(alert_id: str):
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Alert '{alert_id}' not found."
         )
-
     enriched = await enrich_alert(alert.alert_id, alert.source_ip)
     return enriched
 
@@ -168,21 +175,17 @@ async def scan_hash_endpoint(alert_id: str):
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Alert '{alert_id}' not found."
         )
-
     if not alert.file_hash:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Alert '{alert_id}' does not contain a file hash. Only malware alerts have hashes."
         )
-
     result = await lookup_hash(alert.file_hash)
-
     if not result:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="VirusTotal lookup failed. Check your API key in .env file."
         )
-
     return result
 
 

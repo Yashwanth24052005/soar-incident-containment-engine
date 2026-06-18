@@ -1,13 +1,13 @@
 """
 Alerts Router - Webhook ingestion endpoint
-Advanced features: deduplication, rate limiting, status tracking,
-date range search, geolocation, Slack notifications.
+Receives raw SIEM alerts, normalizes them, and persists them via AlertStore.
+Auto-enrichment runs in the background after every ingestion.
 """
 
 import logging
 import asyncio
 from datetime import datetime, timezone
-from fastapi import APIRouter, HTTPException, status, Query, BackgroundTasks, Request, Depends
+from fastapi import APIRouter, HTTPException, status, Query, BackgroundTasks, Request
 from typing import List, Optional
 
 from app.models.alert import RawSIEMAlert, NormalizedAlert, AlertResponse, AttackType, SeverityLevel
@@ -19,6 +19,7 @@ from app.risk_scorer import calculate_composite_score, CompositeRiskScore
 from app.background import auto_enrich_alert
 from app.deduplication import is_duplicate, get_dedup_stats
 from app.rate_limiter import check_rate_limit
+from app.geolocation import get_geolocation, GeoLocation
 
 logger = logging.getLogger("soar.alerts")
 router = APIRouter()
@@ -82,7 +83,7 @@ async def ingest_alert(
 
         alert_store.add(normalized)
 
-        # Background enrichment + Slack notification
+        # Background enrichment + geolocation + Slack notification
         background_tasks.add_task(
             auto_enrich_alert,
             alert_id=normalized.alert_id,
@@ -137,7 +138,6 @@ async def list_alerts(
     """
     results = alert_store.filter(severity=severity, attack_type=attack_type, limit=500)
 
-    # Date range filtering
     if from_date:
         try:
             from_dt = datetime.strptime(from_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
@@ -335,3 +335,34 @@ async def risk_score_endpoint(alert_id: str):
     )
 
     return score
+
+
+# ─── Geolocation ──────────────────────────────────────────────────────────────
+
+@router.get(
+    "/alerts/{alert_id}/geolocate",
+    response_model=GeoLocation,
+    summary="Get geolocation data for the alert's source IP"
+)
+async def geolocate_alert(alert_id: str):
+    """
+    Fetches geographic location of the attacking IP address.
+    Returns country, city, ISP, coordinates, proxy/hosting detection.
+    No API key required — uses ip-api.com free tier.
+    """
+    alert = alert_store.get_by_id(alert_id)
+    if not alert:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Alert '{alert_id}' not found."
+        )
+
+    geo = await get_geolocation(alert.source_ip)
+
+    if not geo:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Could not geolocate IP {alert.source_ip}. May be a private or reserved IP."
+        )
+
+    return geo

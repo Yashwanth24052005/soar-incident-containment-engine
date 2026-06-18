@@ -1,368 +1,193 @@
 """
-Alerts Router - Webhook ingestion endpoint
-Receives raw SIEM alerts, normalizes them, and persists them via AlertStore.
-Auto-enrichment runs in the background after every ingestion.
+Alerts Router - Week 2 Day 5
+Wires the complete Week 2 pipeline into the ingest endpoint:
+  - Rate limiting  (rate_limiter)   → blocks abusive clients
+  - Deduplication  (deduplication)  → suppresses repeated alerts from the same IP
+  - Full enrichment (background)    → geo + AbuseIPDB + VirusTotal + Slack, all async
 """
 
 import logging
-import asyncio
-from datetime import datetime, timezone
-from fastapi import APIRouter, HTTPException, status, Query, BackgroundTasks, Request
-from typing import List, Optional
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, status
 
-from app.models.alert import RawSIEMAlert, NormalizedAlert, AlertResponse, AttackType, SeverityLevel
+from app.models.alert import RawSIEMAlert, NormalizedAlert, SeverityLevel, AttackType
 from app.normalizer import normalize_alert
-from app.store import alert_store, get_alert_status, update_alert_status, get_all_statuses, AlertStatus
-from app.enricher import enrich_alert, EnrichedAlert
-from app.virustotal import lookup_hash, HashReputation
-from app.risk_scorer import calculate_composite_score, CompositeRiskScore
-from app.background import auto_enrich_alert
-from app.deduplication import is_duplicate, get_dedup_stats
+from app.store import alert_store, AlertStatus, update_alert_status, get_alert_status, get_all_statuses, get_dedup_stats_from_store
 from app.rate_limiter import check_rate_limit
-from app.geolocation import get_geolocation, GeoLocation
+from app.deduplication import is_duplicate, get_dedup_stats
+from app.background import auto_enrich_alert
 
-logger = logging.getLogger("soar.alerts")
+logger = logging.getLogger("soar.router.alerts")
+
 router = APIRouter()
 
 
-def _validate_payload(payload: RawSIEMAlert) -> None:
-    has_ip = any([payload.src_ip, payload.source_ip, payload.sourceIPAddress])
-    if not has_ip:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Payload must contain at least one IP field (src_ip, source_ip, or sourceIPAddress)."
-        )
-    has_description = any([payload.alert_type, payload.event_type, payload.message, payload.description])
-    if not has_description:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Payload must contain at least one descriptive field (alert_type, event_type, message, or description)."
-        )
-
-
-# ─── Alert Ingestion ──────────────────────────────────────────────────────────
+# ── Ingest ────────────────────────────────────────────────────────────────────
 
 @router.post(
     "/alerts/ingest",
-    response_model=AlertResponse,
-    status_code=status.HTTP_201_CREATED,
-    summary="Ingest raw SIEM webhook alert"
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="Ingest a raw SIEM alert",
+    description=(
+        "Accepts a raw webhook payload from any SIEM vendor. "
+        "The engine normalizes the payload, checks for duplicates, "
+        "stores the alert, then launches the full enrichment pipeline "
+        "(AbuseIPDB + VirusTotal + Geolocation + Slack) in the background."
+    ),
 )
 async def ingest_alert(
-    payload: RawSIEMAlert,
+    raw: RawSIEMAlert,
     background_tasks: BackgroundTasks,
     request: Request,
 ):
-    """
-    Accepts a raw SIEM webhook payload.
-    Features: rate limiting, deduplication, normalization,
-    persistence, background enrichment, Slack notifications.
-    """
-    # Rate limiting
+    # ── Gate 1: Rate limiting ─────────────────────────────────────────────────
     check_rate_limit(request)
 
-    try:
-        _validate_payload(payload)
-    except HTTPException as e:
-        alert_store.increment_rejected()
-        logger.warning(f"[REJECTED] Invalid payload: {e.detail}")
-        raise
+    # ── Gate 2: Normalize the raw payload ────────────────────────────────────
+    normalized = normalize_alert(raw)
 
-    try:
-        normalized = normalize_alert(payload)
+    # ── Gate 3: Deduplication check ──────────────────────────────────────────
+    duplicate, occurrence = is_duplicate(normalized.source_ip)
 
-        # Deduplication check
-        duplicate, occurrence = is_duplicate(normalized.source_ip)
-        if duplicate:
-            return AlertResponse(
-                success=False,
-                message=f"Duplicate alert suppressed. Same IP seen {occurrence} times in last 5 minutes.",
-                alert_id=normalized.alert_id,
-                normalized_alert=normalized
-            )
-
-        alert_store.add(normalized)
-
-        # Background enrichment + geolocation + Slack notification
-        background_tasks.add_task(
-            auto_enrich_alert,
-            alert_id=normalized.alert_id,
-            source_ip=normalized.source_ip,
-            attack_type=normalized.attack_type.value,
-            severity=normalized.severity.value,
-            file_hash=normalized.file_hash,
+    if duplicate:
+        logger.warning(
+            f"[INGEST] Duplicate suppressed | ip={normalized.source_ip} | "
+            f"occurrence={occurrence} | alert_id={normalized.alert_id}"
         )
+        return {
+            "status": "duplicate_suppressed",
+            "message": (
+                f"Alert from {normalized.source_ip} was suppressed. "
+                f"This is occurrence #{occurrence} within the deduplication window."
+            ),
+            "alert_id": normalized.alert_id,
+            "source_ip": normalized.source_ip,
+            "occurrence": occurrence,
+        }
 
-        logger.info(
-            f"[INGESTED] alert_id={normalized.alert_id} | "
-            f"type={normalized.attack_type.value} | "
-            f"severity={normalized.severity.value} | "
-            f"src={normalized.source_ip}"
-        )
+    # ── Store the normalized alert ────────────────────────────────────────────
+    alert_store.add(normalized)
 
-        return AlertResponse(
-            success=True,
-            message="Alert ingested and normalized. Threat enrichment running in background.",
-            alert_id=normalized.alert_id,
-            normalized_alert=normalized
-        )
+    logger.info(
+        f"[INGEST] Alert accepted | alert_id={normalized.alert_id} | "
+        f"src={normalized.source_ip} | type={normalized.attack_type.value} | "
+        f"severity={normalized.severity.value}"
+    )
 
-    except HTTPException:
-        raise
-    except Exception as e:
-        alert_store.increment_rejected()
-        logger.error(f"[ERROR] Normalization failed: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=f"Alert normalization failed: {str(e)}"
-        )
+    # ── Launch full enrichment pipeline in the background ────────────────────
+    background_tasks.add_task(
+        auto_enrich_alert,
+        alert_id=normalized.alert_id,
+        source_ip=normalized.source_ip,
+        attack_type=normalized.attack_type.value,
+        severity=normalized.severity.value,
+        file_hash=normalized.file_hash,
+    )
 
-
-# ─── Alert Listing + Date Range Search ───────────────────────────────────────
-
-@router.get(
-    "/alerts",
-    response_model=List[NormalizedAlert],
-    summary="List alerts with optional filters and date range search"
-)
-async def list_alerts(
-    severity: Optional[SeverityLevel] = Query(None, description="Filter by severity level"),
-    attack_type: Optional[AttackType] = Query(None, description="Filter by attack type"),
-    limit: int = Query(50, ge=1, le=500, description="Max number of alerts to return"),
-    from_date: Optional[str] = Query(None, description="Start date filter (YYYY-MM-DD)"),
-    to_date: Optional[str] = Query(None, description="End date filter (YYYY-MM-DD)"),
-):
-    """
-    Returns normalized alerts with optional filtering by severity,
-    attack type, and date range. Most recent first.
-    """
-    results = alert_store.filter(severity=severity, attack_type=attack_type, limit=500)
-
-    if from_date:
-        try:
-            from_dt = datetime.strptime(from_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-            results = [a for a in results if a.received_at >= from_dt]
-        except ValueError:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Invalid from_date format. Use YYYY-MM-DD."
-            )
-
-    if to_date:
-        try:
-            to_dt = datetime.strptime(to_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-            results = [a for a in results if a.received_at <= to_dt]
-        except ValueError:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Invalid to_date format. Use YYYY-MM-DD."
-            )
-
-    return results[:limit]
-
-
-# ─── Stats ────────────────────────────────────────────────────────────────────
-
-@router.get(
-    "/alerts/stats",
-    summary="Get alert ingestion statistics"
-)
-async def get_stats():
-    """Returns a live summary of all ingested alerts."""
-    return alert_store.stats()
-
-
-# ─── Deduplication Stats ──────────────────────────────────────────────────────
-
-@router.get(
-    "/alerts/dedup-stats",
-    summary="Get deduplication cache statistics"
-)
-async def dedup_stats():
-    """Returns current deduplication cache — shows which IPs are being suppressed."""
-    return get_dedup_stats()
-
-
-# ─── Alert Status Tracking ────────────────────────────────────────────────────
-
-@router.get(
-    "/alerts/statuses",
-    summary="Get status of all alerts"
-)
-async def get_statuses():
-    """Returns the investigation status of all alerts."""
-    return get_all_statuses()
-
-
-@router.patch(
-    "/alerts/{alert_id}/status",
-    summary="Update alert investigation status"
-)
-async def update_status(alert_id: str, new_status: AlertStatus):
-    """
-    Updates the investigation status of an alert.
-    Statuses: new → investigating → contained → resolved → false_positive
-    """
-    alert = alert_store.get_by_id(alert_id)
-    if not alert:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Alert '{alert_id}' not found."
-        )
-
-    success = update_alert_status(alert_id, new_status.value)
-    if not success:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Invalid status '{new_status}'."
-        )
-
-    logger.info(f"[STATUS] Alert {alert_id} status updated to {new_status.value}")
     return {
-        "alert_id": alert_id,
-        "status": new_status.value,
-        "updated_at": datetime.now(timezone.utc).isoformat()
+        "status": "accepted",
+        "message": "Alert ingested and enrichment pipeline started.",
+        "alert_id": normalized.alert_id,
+        "source_ip": normalized.source_ip,
+        "attack_type": normalized.attack_type.value,
+        "severity": normalized.severity.value,
+        "iocs": normalized.iocs,
+        "enrichment": "running in background (AbuseIPDB + VirusTotal + Geolocation + Slack)",
     }
 
 
-# ─── Get Single Alert ─────────────────────────────────────────────────────────
+# ── List alerts ───────────────────────────────────────────────────────────────
+
+@router.get(
+    "/alerts",
+    summary="List normalized alerts",
+    description="Returns stored alerts, newest first. Filter by severity or attack type.",
+)
+def list_alerts(
+    severity: SeverityLevel = None,
+    attack_type: AttackType = None,
+    limit: int = 50,
+):
+    alerts = alert_store.filter(severity=severity, attack_type=attack_type, limit=limit)
+    return {
+        "total": len(alerts),
+        "alerts": alerts,
+    }
+
+
+# ── Single alert ──────────────────────────────────────────────────────────────
 
 @router.get(
     "/alerts/{alert_id}",
-    response_model=NormalizedAlert,
-    summary="Get a specific normalized alert by ID"
+    summary="Get a single alert by ID",
 )
-async def get_alert(alert_id: str):
-    """Fetch a specific alert by its ID."""
+def get_alert(alert_id: str):
     alert = alert_store.get_by_id(alert_id)
     if not alert:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Alert '{alert_id}' not found."
+            detail=f"Alert '{alert_id}' not found.",
         )
-    return alert
+    return {
+        "alert": alert,
+        "status": get_alert_status(alert_id),
+    }
 
 
-# ─── AbuseIPDB Enrichment ─────────────────────────────────────────────────────
+# ── Update alert status ───────────────────────────────────────────────────────
 
-@router.post(
-    "/alerts/{alert_id}/enrich",
-    response_model=EnrichedAlert,
-    summary="Enrich an alert with AbuseIPDB threat intelligence"
+@router.patch(
+    "/alerts/{alert_id}/status",
+    summary="Update alert investigation status",
+    description=(
+        "Allows SOC analysts to move an alert through the workflow: "
+        "new → investigating → contained → resolved / false_positive."
+    ),
 )
-async def enrich_alert_endpoint(alert_id: str):
-    """
-    Queries AbuseIPDB for the reputation of the alert's source IP.
-    Returns abuse confidence score, risk level, ISP, country, and recommended action.
-    """
+def update_status(alert_id: str, new_status: str):
     alert = alert_store.get_by_id(alert_id)
     if not alert:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Alert '{alert_id}' not found."
+            detail=f"Alert '{alert_id}' not found.",
         )
-    enriched = await enrich_alert(alert.alert_id, alert.source_ip)
-    return enriched
 
-
-# ─── VirusTotal Hash Lookup ───────────────────────────────────────────────────
-
-@router.post(
-    "/alerts/{alert_id}/scan-hash",
-    response_model=HashReputation,
-    summary="Scan alert file hash against VirusTotal"
-)
-async def scan_hash_endpoint(alert_id: str):
-    """
-    Queries VirusTotal for the reputation of the file hash in a malware alert.
-    Returns detection ratio, threat label, and risk level.
-    """
-    alert = alert_store.get_by_id(alert_id)
-    if not alert:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Alert '{alert_id}' not found."
-        )
-    if not alert.file_hash:
+    valid = [s.value for s in AlertStatus]
+    if new_status not in valid:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Alert '{alert_id}' does not contain a file hash."
-        )
-    result = await lookup_hash(alert.file_hash)
-    if not result:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="VirusTotal lookup failed. Check your API key in .env file."
-        )
-    return result
-
-
-# ─── Composite Risk Score ─────────────────────────────────────────────────────
-
-@router.post(
-    "/alerts/{alert_id}/risk-score",
-    response_model=CompositeRiskScore,
-    summary="Calculate composite risk score using all threat intelligence sources"
-)
-async def risk_score_endpoint(alert_id: str):
-    """
-    Queries both AbuseIPDB and VirusTotal in parallel, combines into
-    a single composite risk score with recommended containment action.
-    """
-    alert = alert_store.get_by_id(alert_id)
-    if not alert:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Alert '{alert_id}' not found."
+            detail=f"Invalid status '{new_status}'. Choose from: {valid}",
         )
 
-    tasks = [enrich_alert(alert.alert_id, alert.source_ip)]
-    if alert.file_hash:
-        tasks.append(lookup_hash(alert.file_hash))
-
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-
-    enriched = results[0] if not isinstance(results[0], Exception) else None
-    hash_rep = results[1] if len(results) > 1 and not isinstance(results[1], Exception) else None
-    ip_rep = enriched.ip_reputation if enriched else None
-
-    score = calculate_composite_score(
-        alert_id=alert.alert_id,
-        source_ip=alert.source_ip,
-        file_hash=alert.file_hash,
-        ip_reputation=ip_rep,
-        hash_reputation=hash_rep,
-    )
-
-    return score
+    update_alert_status(alert_id, new_status)
+    logger.info(f"[STATUS] alert_id={alert_id} → {new_status}")
+    return {
+        "alert_id": alert_id,
+        "status": new_status,
+        "message": f"Alert status updated to '{new_status}'.",
+    }
 
 
-# ─── Geolocation ──────────────────────────────────────────────────────────────
+# ── Stats ─────────────────────────────────────────────────────────────────────
 
 @router.get(
-    "/alerts/{alert_id}/geolocate",
-    response_model=GeoLocation,
-    summary="Get geolocation data for the alert's source IP"
+    "/alerts/stats",
+    summary="Engine health and alert statistics",
+    description="Returns ingestion counts, severity/attack-type breakdown, and deduplication cache stats.",
 )
-async def geolocate_alert(alert_id: str):
-    """
-    Fetches geographic location of the attacking IP address.
-    Returns country, city, ISP, coordinates, proxy/hosting detection.
-    No API key required — uses ip-api.com free tier.
-    """
-    alert = alert_store.get_by_id(alert_id)
-    if not alert:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Alert '{alert_id}' not found."
-        )
-
-    geo = await get_geolocation(alert.source_ip)
-
-    if not geo:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Could not geolocate IP {alert.source_ip}. May be a private or reserved IP."
-        )
-
-    return geo
+def get_stats():
+    return {
+        "engine": "SentinelX SOAR — Week 2 Day 5",
+        "pipeline_modules": [
+            "rate_limiter",
+            "deduplication",
+            "normalizer",
+            "enricher (AbuseIPDB)",
+            "virustotal",
+            "geolocation",
+            "risk_scorer",
+            "notifier (Slack)",
+        ],
+        "alert_stats": alert_store.stats(),
+        "deduplication": get_dedup_stats(),
+        "statuses": get_all_statuses(),
+    }

@@ -97,21 +97,77 @@ async def ingest_alert(
 
 # ── List alerts ───────────────────────────────────────────────────────────────
 
+```python
 @router.get(
     "/alerts",
     summary="List normalized alerts",
-    description="Returns stored alerts, newest first. Filter by severity or attack type.",
+    description="Returns stored alerts with advanced filtering and search capabilities.",
 )
 def list_alerts(
     severity: SeverityLevel = None,
     attack_type: AttackType = None,
+    source_ip: str = None,
+    status_filter: str = None,
+    keyword: str = None,
     limit: int = 50,
 ):
-    alerts = alert_store.filter(severity=severity, attack_type=attack_type, limit=limit)
+    """
+    Advanced alert search endpoint.
+
+    Supported filters:
+    - severity
+    - attack_type
+    - source_ip
+    - alert status
+    - keyword search in description
+    """
+
+    alerts = alert_store.get_all()
+
+    if severity:
+        alerts = [a for a in alerts if a.severity == severity]
+
+    if attack_type:
+        alerts = [a for a in alerts if a.attack_type == attack_type]
+
+    if source_ip:
+        alerts = [a for a in alerts if a.source_ip == source_ip]
+
+    if status_filter:
+        alerts = [
+            a for a in alerts
+            if get_alert_status(a.alert_id) == status_filter
+        ]
+
+    if keyword:
+        keyword_lower = keyword.lower()
+
+        alerts = [
+            a for a in alerts
+            if (
+                keyword_lower in (a.description or "").lower()
+                or keyword_lower in a.source_ip.lower()
+                or keyword_lower in a.attack_type.value.lower()
+                or keyword_lower in a.severity.value.lower()
+            )
+        ]
+
+    alerts = alerts[:limit]
+
     return {
         "total": len(alerts),
+        "filters": {
+            "severity": severity.value if severity else None,
+            "attack_type": attack_type.value if attack_type else None,
+            "source_ip": source_ip,
+            "status": status_filter,
+            "keyword": keyword,
+            "limit": limit,
+        },
         "alerts": alerts,
     }
+```
+
 
 
 # ── Single alert ──────────────────────────────────────────────────────────────

@@ -175,18 +175,6 @@ Reduces manual triage effort by automating repetitive security operations tasks.
 * Demonstrate enterprise-grade cybersecurity engineering practices
 
 ---
-
-## Development Roadmap
-
-| Phase  | Description                          |
-| ------ | ------------------------------------ |
-| Week 1 | Alert Ingestion & Data Normalization |
-| Week 2 | Threat Intelligence Enrichment       |
-| Week 3 | Automated Playbook Execution         |
-| Week 4 | Dashboard, RBAC & Case Management    |
-
----
-
 ## Author
 
 Yashwanth

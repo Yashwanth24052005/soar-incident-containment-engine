@@ -1,6 +1,7 @@
 """
-Brute Force Playbook - Week 3 Day 1
-Automatically blocks attacking IPs detected in brute force attacks.
+Brute Force Playbook - Week 3 Day 3 (Updated)
+Now uses real AWS Security Group integration via boto3.
+Falls back to simulation if AWS credentials are not configured.
 """
 
 import logging
@@ -9,6 +10,7 @@ from datetime import datetime, timezone
 from typing import Dict
 
 from app.playbooks.base import BasePlaybook, PlaybookResult
+from app.aws_integration import block_ip_in_security_group
 
 logger = logging.getLogger("soar.playbook.brute_force")
 
@@ -20,13 +22,8 @@ def get_blocked_ips() -> Dict[str, Dict]:
 
 
 class BruteForcePlaybook(BasePlaybook):
-    """
-    Playbook triggered on brute force attacks with medium+ risk score.
-    Actions: validate → simulate firewall block → audit log → recommend followup.
-    """
-
     name = "BruteForceContainment"
-    description = "Blocks source IP on detection of brute force attack"
+    description = "Blocks source IP via AWS Security Group on brute force detection"
     min_risk_score = 25
 
     async def execute(self) -> PlaybookResult:
@@ -48,55 +45,48 @@ class BruteForcePlaybook(BasePlaybook):
                 recommended_followup="Review login logs for compromised accounts."
             )
 
-        try:
-            block_result = await self._simulate_firewall_block(self.source_ip)
+        aws_result = await block_ip_in_security_group(
+            ip_address=self.source_ip,
+            alert_id=self.alert_id,
+            description=f"Brute force attack | risk={self.risk_level} | score={self.composite_score}",
+        )
 
-            if block_result:
-                _blocked_ips[self.source_ip] = {
-                    "blocked_at": datetime.now(timezone.utc).isoformat(),
-                    "alert_id": self.alert_id,
-                    "risk_level": self.risk_level,
-                    "composite_score": self.composite_score,
-                    "playbook": self.name,
-                }
+        elapsed = (time.perf_counter() - start_time) * 1000
 
-                elapsed = (time.perf_counter() - start_time) * 1000
-
-                logger.warning(
-                    f"[PLAYBOOK] *** IP BLOCKED *** | "
-                    f"ip={self.source_ip} | alert_id={self.alert_id} | "
-                    f"score={self.composite_score} | time={elapsed:.1f}ms"
+        if aws_result["success"]:
+            _blocked_ips[self.source_ip] = {
+                "blocked_at": datetime.now(timezone.utc).isoformat(),
+                "alert_id": self.alert_id,
+                "risk_level": self.risk_level,
+                "composite_score": self.composite_score,
+                "mode": aws_result.get("mode", "unknown"),
+                "playbook": self.name,
+            }
+            logger.warning(
+                f"[PLAYBOOK] *** IP BLOCKED *** | ip={self.source_ip} | "
+                f"mode={aws_result.get('mode')} | time={elapsed:.1f}ms"
+            )
+            return self._build_result(
+                success=True,
+                action_taken="ip_blocked",
+                details=(
+                    f"{aws_result['message']} | "
+                    f"Mode: {aws_result.get('mode')} | "
+                    f"Risk score: {self.composite_score}/100"
+                ),
+                execution_time_ms=elapsed,
+                recommended_followup=(
+                    "1. Review SSH logs for successful logins from this IP. "
+                    "2. Check for lateral movement. "
+                    "3. Reset credentials for targeted accounts. "
+                    "4. Verify AWS Security Group rule was applied."
                 )
-
-                return self._build_result(
-                    success=True,
-                    action_taken="ip_blocked",
-                    details=(
-                        f"IP {self.source_ip} successfully blocked via firewall API. "
-                        f"Risk score: {self.composite_score}/100."
-                    ),
-                    execution_time_ms=elapsed,
-                    recommended_followup=(
-                        "1. Review SSH logs for successful logins from this IP. "
-                        "2. Check for lateral movement. "
-                        "3. Reset credentials for targeted accounts."
-                    )
-                )
-
-        except Exception as e:
-            elapsed = (time.perf_counter() - start_time) * 1000
-            logger.error(f"[PLAYBOOK] Firewall block failed for {self.source_ip}: {e}")
+            )
+        else:
             return self._build_result(
                 success=False,
                 action_taken="block_failed",
-                details=f"Failed to block IP {self.source_ip}: {str(e)}",
+                details=f"AWS block failed: {aws_result['message']}",
                 execution_time_ms=elapsed,
-                recommended_followup="Manual intervention required."
+                recommended_followup="Manual intervention required. Block IP on AWS console."
             )
-
-    async def _simulate_firewall_block(self, ip_address: str) -> bool:
-        import asyncio
-        logger.info(f"[PLAYBOOK] Calling firewall API to block {ip_address}...")
-        await asyncio.sleep(0.1)
-        logger.info(f"[PLAYBOOK] Firewall API: 200 OK | {ip_address} blocked")
-        return True

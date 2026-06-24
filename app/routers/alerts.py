@@ -24,6 +24,7 @@ from app.playbook_engine import execute_playbook, get_execution_log, get_executi
 from app.playbooks.brute_force import get_blocked_ips
 from app.playbooks.malware import get_isolated_hosts
 from app.playbooks.port_scan import get_rate_limited_ips, get_monitored_ips
+from app.aws_integration import get_aws_blocked_ips, unblock_ip_in_security_group
 
 logger = logging.getLogger("soar.alerts")
 router = APIRouter()
@@ -190,13 +191,13 @@ async def playbook_stats():
 
 @router.get("/playbooks/blocked-ips", summary="Get IPs blocked by brute force playbook")
 async def blocked_ips():
-    """Returns all IPs currently blocked by the brute force containment playbook."""
+    """Returns all IPs blocked by the brute force containment playbook."""
     return get_blocked_ips()
 
 
 @router.get("/playbooks/isolated-hosts", summary="Get hosts isolated by malware playbook")
 async def isolated_hosts():
-    """Returns all hosts currently isolated by the malware containment playbook."""
+    """Returns all hosts isolated by the malware containment playbook."""
     return get_isolated_hosts()
 
 
@@ -212,12 +213,24 @@ async def monitored_ips():
     return get_monitored_ips()
 
 
+@router.get("/playbooks/aws-blocked-ips", summary="Get IPs blocked via AWS Security Group")
+async def aws_blocked_ips():
+    """Returns all IPs currently blocked via AWS Security Group rules."""
+    return get_aws_blocked_ips()
+
+
+@router.delete("/playbooks/aws-blocked-ips/{ip_address}", summary="Unblock an IP from AWS Security Group")
+async def unblock_ip(ip_address: str):
+    """Removes the block rule for an IP — use when alert is a false positive."""
+    result = await unblock_ip_in_security_group(ip_address)
+    if not result["success"]:
+        raise HTTPException(status_code=404, detail=result["message"])
+    return result
+
+
 @router.post("/playbooks/execute/{alert_id}", summary="Manually trigger playbook for an alert")
 async def manual_playbook_execute(alert_id: str, composite_score: int = Query(75)):
-    """
-    Manually triggers playbook execution for a specific alert.
-    Useful for testing or re-running a playbook on an existing alert.
-    """
+    """Manually triggers playbook execution for a specific alert."""
     alert = alert_store.get_by_id(alert_id)
     if not alert:
         raise HTTPException(status_code=404, detail=f"Alert '{alert_id}' not found.")

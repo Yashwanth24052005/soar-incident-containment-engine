@@ -1,7 +1,7 @@
 """
 Alerts Router - Webhook ingestion endpoint
 Receives raw SIEM alerts, normalizes them, and persists them via AlertStore.
-Auto-enrichment, geolocation, risk scoring and playbook execution in background.
+Full pipeline with case management timeline recording.
 """
 
 import logging
@@ -25,6 +25,7 @@ from app.playbooks.brute_force import get_blocked_ips
 from app.playbooks.malware import get_isolated_hosts
 from app.playbooks.port_scan import get_rate_limited_ips, get_monitored_ips
 from app.aws_integration import get_aws_blocked_ips, unblock_ip_in_security_group
+from app.timeline import add_event, get_timeline, get_all_timelines, get_timeline_stats, EventType
 
 logger = logging.getLogger("soar.alerts")
 router = APIRouter()
@@ -61,7 +62,7 @@ async def ingest_alert(
     """
     Accepts a raw SIEM webhook payload.
     Pipeline: validate → deduplicate → normalize → persist →
-    background(enrich + geolocate + risk score + playbook + notify)
+    background(enrich + geolocate + risk score + playbook + timeline + notify)
     """
     check_rate_limit(request)
 
@@ -77,6 +78,11 @@ async def ingest_alert(
 
         duplicate, occurrence = is_duplicate(normalized.source_ip)
         if duplicate:
+            add_event(
+                alert_id=normalized.alert_id,
+                event_type=EventType.ALERT_DEDUPLICATED,
+                summary=f"Duplicate suppressed. Same IP seen {occurrence} times in last 5 minutes.",
+            )
             return AlertResponse(
                 success=False,
                 message=f"Duplicate alert suppressed. Same IP seen {occurrence} times in last 5 minutes.",
@@ -85,6 +91,20 @@ async def ingest_alert(
             )
 
         alert_store.add(normalized)
+
+        # Record alert ingestion in timeline
+        add_event(
+            alert_id=normalized.alert_id,
+            event_type=EventType.ALERT_INGESTED,
+            summary=f"Alert ingested: {normalized.attack_type.value} from {normalized.source_ip} | severity={normalized.severity.value}",
+            details={
+                "source_ip": normalized.source_ip,
+                "attack_type": normalized.attack_type.value,
+                "severity": normalized.severity.value,
+                "hostname": normalized.hostname,
+                "file_hash": normalized.file_hash,
+            }
+        )
 
         background_tasks.add_task(
             auto_enrich_alert,
@@ -159,69 +179,110 @@ async def list_alerts(
 
 @router.get("/alerts/stats", summary="Get alert ingestion statistics")
 async def get_stats():
-    """Returns a live summary of all ingested alerts."""
     return alert_store.stats()
 
 
 @router.get("/alerts/dedup-stats", summary="Get deduplication cache statistics")
 async def dedup_stats():
-    """Returns current deduplication cache — shows which IPs are being suppressed."""
     return get_dedup_stats()
 
 
 @router.get("/alerts/statuses", summary="Get status of all alerts")
 async def get_statuses():
-    """Returns the investigation status of all alerts."""
     return get_all_statuses()
+
+
+# ─── Timeline Endpoints ───────────────────────────────────────────────────────
+
+@router.get("/timeline", summary="Get all alert timelines")
+async def all_timelines():
+    """Returns chronological timelines for all alerts. Most recently updated first."""
+    return get_all_timelines()
+
+
+@router.get("/timeline/stats", summary="Get timeline statistics")
+async def timeline_stats():
+    """Returns summary statistics across all alert timelines."""
+    return get_timeline_stats()
+
+
+@router.get("/timeline/{alert_id}", summary="Get timeline for a specific alert")
+async def alert_timeline(alert_id: str):
+    """
+    Returns the complete chronological timeline of all automated
+    actions taken for a specific alert.
+    """
+    alert = alert_store.get_by_id(alert_id)
+    if not alert:
+        raise HTTPException(status_code=404, detail=f"Alert '{alert_id}' not found.")
+
+    timeline = get_timeline(alert_id)
+    if not timeline:
+        return {"alert_id": alert_id, "message": "No timeline events recorded yet.", "events": []}
+
+    return timeline
+
+
+@router.post("/timeline/{alert_id}/note", summary="Add manual note to alert timeline")
+async def add_timeline_note(alert_id: str, note: str = Query(..., description="Note to add to the timeline")):
+    """
+    Allows a SOC analyst to add a manual note to an alert's timeline.
+    Useful for documenting investigation steps and decisions.
+    """
+    alert = alert_store.get_by_id(alert_id)
+    if not alert:
+        raise HTTPException(status_code=404, detail=f"Alert '{alert_id}' not found.")
+
+    event = add_event(
+        alert_id=alert_id,
+        event_type=EventType.MANUAL_ACTION,
+        summary=f"Analyst note: {note}",
+        actor="analyst",
+        details={"note": note},
+    )
+
+    return {"message": "Note added to timeline.", "event_id": event.event_id}
 
 
 # ─── Playbook Endpoints ───────────────────────────────────────────────────────
 
 @router.get("/playbooks/log", summary="Get playbook execution audit log")
 async def playbook_log():
-    """Returns the full audit log of all playbook executions."""
     return get_execution_log()
 
 
 @router.get("/playbooks/stats", summary="Get playbook execution statistics")
 async def playbook_stats():
-    """Returns summary statistics of all playbook executions."""
     return get_execution_stats()
 
 
 @router.get("/playbooks/blocked-ips", summary="Get IPs blocked by brute force playbook")
 async def blocked_ips():
-    """Returns all IPs blocked by the brute force containment playbook."""
     return get_blocked_ips()
 
 
 @router.get("/playbooks/isolated-hosts", summary="Get hosts isolated by malware playbook")
 async def isolated_hosts():
-    """Returns all hosts isolated by the malware containment playbook."""
     return get_isolated_hosts()
 
 
 @router.get("/playbooks/rate-limited-ips", summary="Get rate limited IPs")
 async def rate_limited_ips():
-    """Returns all IPs rate limited by the port scan playbook."""
     return get_rate_limited_ips()
 
 
 @router.get("/playbooks/monitored-ips", summary="Get IPs under enhanced monitoring")
 async def monitored_ips():
-    """Returns all IPs under enhanced monitoring by the port scan playbook."""
     return get_monitored_ips()
 
 
 @router.get("/playbooks/aws-blocked-ips", summary="Get IPs blocked via AWS Security Group")
 async def aws_blocked_ips():
-    """Returns all IPs currently blocked via AWS Security Group rules."""
     return get_aws_blocked_ips()
 
 
 @router.delete("/playbooks/aws-blocked-ips/{ip_address}", summary="Unblock an IP from AWS Security Group")
 async def unblock_ip(ip_address: str):
-    """Removes the block rule for an IP — use when alert is a false positive."""
     result = await unblock_ip_in_security_group(ip_address)
     if not result["success"]:
         raise HTTPException(status_code=404, detail=result["message"])
@@ -230,7 +291,6 @@ async def unblock_ip(ip_address: str):
 
 @router.post("/playbooks/execute/{alert_id}", summary="Manually trigger playbook for an alert")
 async def manual_playbook_execute(alert_id: str, composite_score: int = Query(75)):
-    """Manually triggers playbook execution for a specific alert."""
     alert = alert_store.get_by_id(alert_id)
     if not alert:
         raise HTTPException(status_code=404, detail=f"Alert '{alert_id}' not found.")
@@ -251,6 +311,13 @@ async def manual_playbook_execute(alert_id: str, composite_score: int = Query(75
     if not result:
         return {"message": "No playbook matched for this alert type and risk score."}
 
+    add_event(
+        alert_id=alert_id,
+        event_type=EventType.MANUAL_ACTION,
+        summary=f"Manual playbook execution: {result.playbook_name} | action={result.action_taken}",
+        actor="analyst",
+    )
+
     return result
 
 
@@ -258,13 +325,21 @@ async def manual_playbook_execute(alert_id: str, composite_score: int = Query(75
 
 @router.patch("/alerts/{alert_id}/status", summary="Update alert investigation status")
 async def update_status(alert_id: str, new_status: AlertStatus):
-    """Updates the investigation status of an alert."""
     alert = alert_store.get_by_id(alert_id)
     if not alert:
         raise HTTPException(status_code=404, detail=f"Alert '{alert_id}' not found.")
     success = update_alert_status(alert_id, new_status.value)
     if not success:
         raise HTTPException(status_code=400, detail=f"Invalid status '{new_status}'.")
+
+    add_event(
+        alert_id=alert_id,
+        event_type=EventType.STATUS_CHANGED,
+        summary=f"Alert status updated to: {new_status.value}",
+        actor="analyst",
+        details={"new_status": new_status.value},
+    )
+
     logger.info(f"[STATUS] Alert {alert_id} → {new_status.value}")
     return {
         "alert_id": alert_id,
@@ -277,7 +352,6 @@ async def update_status(alert_id: str, new_status: AlertStatus):
 
 @router.get("/alerts/{alert_id}", response_model=NormalizedAlert, summary="Get a specific alert by ID")
 async def get_alert(alert_id: str):
-    """Fetch a specific alert by its ID."""
     alert = alert_store.get_by_id(alert_id)
     if not alert:
         raise HTTPException(status_code=404, detail=f"Alert '{alert_id}' not found.")
@@ -288,7 +362,6 @@ async def get_alert(alert_id: str):
 
 @router.post("/alerts/{alert_id}/enrich", response_model=EnrichedAlert, summary="Enrich alert with AbuseIPDB")
 async def enrich_alert_endpoint(alert_id: str):
-    """Queries AbuseIPDB for the reputation of the alert source IP."""
     alert = alert_store.get_by_id(alert_id)
     if not alert:
         raise HTTPException(status_code=404, detail=f"Alert '{alert_id}' not found.")
@@ -299,7 +372,6 @@ async def enrich_alert_endpoint(alert_id: str):
 
 @router.post("/alerts/{alert_id}/scan-hash", response_model=HashReputation, summary="Scan file hash on VirusTotal")
 async def scan_hash_endpoint(alert_id: str):
-    """Queries VirusTotal for the reputation of the file hash in a malware alert."""
     alert = alert_store.get_by_id(alert_id)
     if not alert:
         raise HTTPException(status_code=404, detail=f"Alert '{alert_id}' not found.")
@@ -315,7 +387,6 @@ async def scan_hash_endpoint(alert_id: str):
 
 @router.post("/alerts/{alert_id}/risk-score", response_model=CompositeRiskScore, summary="Calculate composite risk score")
 async def risk_score_endpoint(alert_id: str):
-    """Queries AbuseIPDB and VirusTotal in parallel and returns composite risk score."""
     alert = alert_store.get_by_id(alert_id)
     if not alert:
         raise HTTPException(status_code=404, detail=f"Alert '{alert_id}' not found.")
@@ -339,7 +410,6 @@ async def risk_score_endpoint(alert_id: str):
 
 @router.get("/alerts/{alert_id}/geolocate", response_model=GeoLocation, summary="Geolocate alert source IP")
 async def geolocate_alert(alert_id: str):
-    """Fetches geographic location of the attacking IP address."""
     alert = alert_store.get_by_id(alert_id)
     if not alert:
         raise HTTPException(status_code=404, detail=f"Alert '{alert_id}' not found.")

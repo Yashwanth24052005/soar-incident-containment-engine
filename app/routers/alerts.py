@@ -1,13 +1,12 @@
 """
-Alerts Router - Webhook ingestion endpoint
-Receives raw SIEM alerts, normalizes them, and persists them via AlertStore.
-Full pipeline with case management timeline recording.
+Alerts Router - Week 3 Day 5
+Full pipeline with RBAC protection on high-impact playbook execution.
 """
 
 import logging
 import asyncio
 from datetime import datetime, timezone
-from fastapi import APIRouter, HTTPException, status, Query, BackgroundTasks, Request
+from fastapi import APIRouter, HTTPException, status, Query, BackgroundTasks, Request, Depends
 from typing import List, Optional
 
 from app.models.alert import RawSIEMAlert, NormalizedAlert, AlertResponse, AttackType, SeverityLevel
@@ -26,6 +25,7 @@ from app.playbooks.malware import get_isolated_hosts
 from app.playbooks.port_scan import get_rate_limited_ips, get_monitored_ips
 from app.aws_integration import get_aws_blocked_ips, unblock_ip_in_security_group
 from app.timeline import add_event, get_timeline, get_all_timelines, get_timeline_stats, EventType
+from app.rbac import get_current_user, require_senior_analyst, check_playbook_permission, get_rbac_summary, User, HIGH_IMPACT_PLAYBOOKS, SENIOR_APPROVAL_THRESHOLD
 
 logger = logging.getLogger("soar.alerts")
 router = APIRouter()
@@ -36,13 +36,13 @@ def _validate_payload(payload: RawSIEMAlert) -> None:
     if not has_ip:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Payload must contain at least one IP field (src_ip, source_ip, or sourceIPAddress)."
+            detail="Payload must contain at least one IP field."
         )
     has_description = any([payload.alert_type, payload.event_type, payload.message, payload.description])
     if not has_description:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Payload must contain at least one descriptive field (alert_type, event_type, message, or description)."
+            detail="Payload must contain at least one descriptive field."
         )
 
 
@@ -92,7 +92,6 @@ async def ingest_alert(
 
         alert_store.add(normalized)
 
-        # Record alert ingestion in timeline
         add_event(
             alert_id=normalized.alert_id,
             event_type=EventType.ALERT_INGESTED,
@@ -141,37 +140,30 @@ async def ingest_alert(
         )
 
 
-# ─── Alert Listing + Date Range Search ───────────────────────────────────────
+# ─── Alert Listing ────────────────────────────────────────────────────────────
 
-@router.get(
-    "/alerts",
-    response_model=List[NormalizedAlert],
-    summary="List alerts with optional filters and date range search"
-)
+@router.get("/alerts", response_model=List[NormalizedAlert], summary="List alerts with filters")
 async def list_alerts(
-    severity: Optional[SeverityLevel] = Query(None, description="Filter by severity level"),
-    attack_type: Optional[AttackType] = Query(None, description="Filter by attack type"),
-    limit: int = Query(50, ge=1, le=500, description="Max number of alerts to return"),
-    from_date: Optional[str] = Query(None, description="Start date filter (YYYY-MM-DD)"),
-    to_date: Optional[str] = Query(None, description="End date filter (YYYY-MM-DD)"),
+    severity: Optional[SeverityLevel] = Query(None),
+    attack_type: Optional[AttackType] = Query(None),
+    limit: int = Query(50, ge=1, le=500),
+    from_date: Optional[str] = Query(None, description="YYYY-MM-DD"),
+    to_date: Optional[str] = Query(None, description="YYYY-MM-DD"),
 ):
     """Returns normalized alerts with optional filtering. Most recent first."""
     results = alert_store.filter(severity=severity, attack_type=attack_type, limit=500)
-
     if from_date:
         try:
             from_dt = datetime.strptime(from_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
             results = [a for a in results if a.received_at >= from_dt]
         except ValueError:
-            raise HTTPException(status_code=400, detail="Invalid from_date format. Use YYYY-MM-DD.")
-
+            raise HTTPException(status_code=400, detail="Invalid from_date. Use YYYY-MM-DD.")
     if to_date:
         try:
             to_dt = datetime.strptime(to_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
             results = [a for a in results if a.received_at <= to_dt]
         except ValueError:
-            raise HTTPException(status_code=400, detail="Invalid to_date format. Use YYYY-MM-DD.")
-
+            raise HTTPException(status_code=400, detail="Invalid to_date. Use YYYY-MM-DD.")
     return results[:limit]
 
 
@@ -192,6 +184,31 @@ async def get_statuses():
     return get_all_statuses()
 
 
+# ─── RBAC Endpoints ───────────────────────────────────────────────────────────
+
+@router.get("/rbac/summary", summary="Get RBAC configuration summary")
+async def rbac_summary():
+    """Returns the current RBAC configuration — roles, users, and permissions."""
+    return get_rbac_summary()
+
+
+@router.get("/rbac/me", summary="Get current authenticated user info")
+async def get_me(user: User = Depends(get_current_user)):
+    """Returns the currently authenticated user's role and permissions."""
+    return {
+        "username": user.username,
+        "role": user.role,
+        "permissions": {
+            "view_alerts": True,
+            "view_timelines": True,
+            "update_alert_status": True,
+            "execute_low_impact_playbooks": True,
+            "execute_high_impact_playbooks": user.role in ("senior_analyst", "admin"),
+            "manage_users": user.role == "admin",
+        }
+    }
+
+
 # ─── Timeline Endpoints ───────────────────────────────────────────────────────
 
 @router.get("/timeline", summary="Get all alert timelines")
@@ -208,39 +225,33 @@ async def timeline_stats():
 
 @router.get("/timeline/{alert_id}", summary="Get timeline for a specific alert")
 async def alert_timeline(alert_id: str):
-    """
-    Returns the complete chronological timeline of all automated
-    actions taken for a specific alert.
-    """
+    """Returns the complete chronological timeline of all automated actions for an alert."""
     alert = alert_store.get_by_id(alert_id)
     if not alert:
         raise HTTPException(status_code=404, detail=f"Alert '{alert_id}' not found.")
-
     timeline = get_timeline(alert_id)
     if not timeline:
         return {"alert_id": alert_id, "message": "No timeline events recorded yet.", "events": []}
-
     return timeline
 
 
 @router.post("/timeline/{alert_id}/note", summary="Add manual note to alert timeline")
-async def add_timeline_note(alert_id: str, note: str = Query(..., description="Note to add to the timeline")):
-    """
-    Allows a SOC analyst to add a manual note to an alert's timeline.
-    Useful for documenting investigation steps and decisions.
-    """
+async def add_timeline_note(
+    alert_id: str,
+    note: str = Query(..., description="Note to add"),
+    user: User = Depends(get_current_user),
+):
+    """Allows a SOC analyst to add a manual note to an alert's timeline."""
     alert = alert_store.get_by_id(alert_id)
     if not alert:
         raise HTTPException(status_code=404, detail=f"Alert '{alert_id}' not found.")
-
     event = add_event(
         alert_id=alert_id,
         event_type=EventType.MANUAL_ACTION,
-        summary=f"Analyst note: {note}",
-        actor="analyst",
-        details={"note": note},
+        summary=f"[{user.username}] {note}",
+        actor=user.username,
+        details={"note": note, "added_by": user.username, "role": user.role},
     )
-
     return {"message": "Note added to timeline.", "event_id": event.event_id}
 
 
@@ -281,22 +292,62 @@ async def aws_blocked_ips():
     return get_aws_blocked_ips()
 
 
-@router.delete("/playbooks/aws-blocked-ips/{ip_address}", summary="Unblock an IP from AWS Security Group")
-async def unblock_ip(ip_address: str):
+@router.delete(
+    "/playbooks/aws-blocked-ips/{ip_address}",
+    summary="Unblock IP from AWS Security Group — Senior Analyst only"
+)
+async def unblock_ip(
+    ip_address: str,
+    user: User = Depends(require_senior_analyst),
+):
+    """Removes block rule for an IP. Requires Senior Analyst or Admin role."""
     result = await unblock_ip_in_security_group(ip_address)
     if not result["success"]:
         raise HTTPException(status_code=404, detail=result["message"])
+    add_event(
+        alert_id="system",
+        event_type=EventType.MANUAL_ACTION,
+        summary=f"[{user.username}] Unblocked IP {ip_address} from AWS Security Group",
+        actor=user.username,
+    )
     return result
 
 
-@router.post("/playbooks/execute/{alert_id}", summary="Manually trigger playbook for an alert")
-async def manual_playbook_execute(alert_id: str, composite_score: int = Query(75)):
+@router.post(
+    "/playbooks/execute/{alert_id}",
+    summary="Manually trigger playbook — Senior Analyst required for high-impact"
+)
+async def manual_playbook_execute(
+    alert_id: str,
+    composite_score: int = Query(75),
+    user: User = Depends(get_current_user),
+):
+    """
+    Manually triggers playbook execution for a specific alert.
+    High-impact playbooks (score ≥ 70) require Senior Analyst role.
+    """
     alert = alert_store.get_by_id(alert_id)
     if not alert:
         raise HTTPException(status_code=404, detail=f"Alert '{alert_id}' not found.")
 
     from app.risk_scorer import _risk_level_from_score
     risk_level = _risk_level_from_score(composite_score)
+
+    attack_to_playbook = {
+        "brute_force": "BruteForceContainment",
+        "malware": "MalwareContainment",
+    }
+    playbook_name = attack_to_playbook.get(alert.attack_type.value, "")
+
+    if not check_playbook_permission(user, playbook_name, composite_score):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                f"High-impact playbook execution requires Senior Analyst role. "
+                f"Score {composite_score} ≥ threshold {SENIOR_APPROVAL_THRESHOLD}. "
+                f"Your role: {user.role}."
+            )
+        )
 
     result = await execute_playbook(
         alert_id=alert.alert_id,
@@ -314,8 +365,8 @@ async def manual_playbook_execute(alert_id: str, composite_score: int = Query(75
     add_event(
         alert_id=alert_id,
         event_type=EventType.MANUAL_ACTION,
-        summary=f"Manual playbook execution: {result.playbook_name} | action={result.action_taken}",
-        actor="analyst",
+        summary=f"[{user.username}] Manual playbook: {result.playbook_name} | action={result.action_taken}",
+        actor=user.username,
     )
 
     return result
@@ -324,26 +375,30 @@ async def manual_playbook_execute(alert_id: str, composite_score: int = Query(75
 # ─── Alert Status Tracking ────────────────────────────────────────────────────
 
 @router.patch("/alerts/{alert_id}/status", summary="Update alert investigation status")
-async def update_status(alert_id: str, new_status: AlertStatus):
+async def update_status(
+    alert_id: str,
+    new_status: AlertStatus,
+    user: User = Depends(get_current_user),
+):
+    """Updates the investigation status of an alert."""
     alert = alert_store.get_by_id(alert_id)
     if not alert:
         raise HTTPException(status_code=404, detail=f"Alert '{alert_id}' not found.")
     success = update_alert_status(alert_id, new_status.value)
     if not success:
         raise HTTPException(status_code=400, detail=f"Invalid status '{new_status}'.")
-
     add_event(
         alert_id=alert_id,
         event_type=EventType.STATUS_CHANGED,
-        summary=f"Alert status updated to: {new_status.value}",
-        actor="analyst",
-        details={"new_status": new_status.value},
+        summary=f"[{user.username}] Status updated to: {new_status.value}",
+        actor=user.username,
+        details={"new_status": new_status.value, "updated_by": user.username},
     )
-
-    logger.info(f"[STATUS] Alert {alert_id} → {new_status.value}")
+    logger.info(f"[STATUS] Alert {alert_id} → {new_status.value} by {user.username}")
     return {
         "alert_id": alert_id,
         "status": new_status.value,
+        "updated_by": user.username,
         "updated_at": datetime.now(timezone.utc).isoformat()
     }
 
@@ -352,6 +407,7 @@ async def update_status(alert_id: str, new_status: AlertStatus):
 
 @router.get("/alerts/{alert_id}", response_model=NormalizedAlert, summary="Get a specific alert by ID")
 async def get_alert(alert_id: str):
+    """Fetch a specific alert by its ID."""
     alert = alert_store.get_by_id(alert_id)
     if not alert:
         raise HTTPException(status_code=404, detail=f"Alert '{alert_id}' not found.")
@@ -362,6 +418,7 @@ async def get_alert(alert_id: str):
 
 @router.post("/alerts/{alert_id}/enrich", response_model=EnrichedAlert, summary="Enrich alert with AbuseIPDB")
 async def enrich_alert_endpoint(alert_id: str):
+    """Queries AbuseIPDB for the reputation of the alert source IP."""
     alert = alert_store.get_by_id(alert_id)
     if not alert:
         raise HTTPException(status_code=404, detail=f"Alert '{alert_id}' not found.")
@@ -372,6 +429,7 @@ async def enrich_alert_endpoint(alert_id: str):
 
 @router.post("/alerts/{alert_id}/scan-hash", response_model=HashReputation, summary="Scan file hash on VirusTotal")
 async def scan_hash_endpoint(alert_id: str):
+    """Queries VirusTotal for the reputation of the file hash in a malware alert."""
     alert = alert_store.get_by_id(alert_id)
     if not alert:
         raise HTTPException(status_code=404, detail=f"Alert '{alert_id}' not found.")
@@ -387,6 +445,7 @@ async def scan_hash_endpoint(alert_id: str):
 
 @router.post("/alerts/{alert_id}/risk-score", response_model=CompositeRiskScore, summary="Calculate composite risk score")
 async def risk_score_endpoint(alert_id: str):
+    """Queries AbuseIPDB and VirusTotal in parallel and returns composite risk score."""
     alert = alert_store.get_by_id(alert_id)
     if not alert:
         raise HTTPException(status_code=404, detail=f"Alert '{alert_id}' not found.")
@@ -410,6 +469,7 @@ async def risk_score_endpoint(alert_id: str):
 
 @router.get("/alerts/{alert_id}/geolocate", response_model=GeoLocation, summary="Geolocate alert source IP")
 async def geolocate_alert(alert_id: str):
+    """Fetches geographic location of the attacking IP address."""
     alert = alert_store.get_by_id(alert_id)
     if not alert:
         raise HTTPException(status_code=404, detail=f"Alert '{alert_id}' not found.")

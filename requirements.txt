@@ -2,6 +2,8 @@ fastapi==0.115.0
 uvicorn[standard]==0.30.6
 pydantic==2.8.2
 python-dotenv==1.0.1
-httpx==0.27.2        # Used in Week 2 for threat intelligence API calls
-pytest==8.3.3
-pytest-asyncio==0.24.0
+httpx==0.27.2
+boto3==1.34.131
+streamlit==1.35.0
+pandas==2.2.2
+requests==2.32.3

@@ -1,32 +1,56 @@
+"""
+SOAR Case Management Dashboard - Main Entry Point
+Week 4: Streamlit dashboard with RBAC-aware navigation.
+"""
+
 import streamlit as st
-import sys
-import os
-
-sys.path.insert(0, os.path.dirname(__file__))
-
-from auth import login_page, is_logged_in
-from components.sidebar import render_sidebar
-from pages.home import render_home
+from dashboard.auth import is_authenticated, show_login_page
+from dashboard.components.sidebar import render_sidebar
+from dashboard.pages import home, cases, incidents, playbooks, admin
 
 st.set_page_config(
-    page_title="SOAR Dashboard",
+    page_title="SOAR Case Management Dashboard",
     page_icon="🛡️",
-    layout="wide"
+    layout="wide",
+    initial_sidebar_state="expanded",
 )
 
-if not is_logged_in():
-    login_page()
-else:
-    page = render_sidebar()
+st.markdown("""
+<style>
+    .stButton > button {
+        background-color: #1d4ed8;
+        color: white;
+        border-radius: 8px;
+        border: none;
+    }
+    .stButton > button:hover {
+        background-color: #2563eb;
+    }
+</style>
+""", unsafe_allow_html=True)
 
-    if page == "🏠 Home":
-        render_home()
-    elif page == "📋 Cases":
-        st.title("📋 Case Management")
-        st.info("Coming on Day 2 — Case list with filters and RBAC actions.")
-    elif page == "⚡ Incidents":
-        st.title("⚡ Incident Timeline")
-        st.info("Coming on Day 3 — Full incident timeline view.")
-    elif page == "⚙️ Admin Panel":
-        st.title("⚙️ Admin Panel")
-        st.info("Coming on Day 4 — User management and audit logs.")
+
+def main():
+    if not is_authenticated():
+        show_login_page()
+        st.stop()
+
+    selected_page = render_sidebar()
+
+    page_map = {
+        "🏠 Home": home,
+        "🚨 Cases": cases,
+        "📋 Incidents": incidents,
+        "🎯 Playbooks": playbooks,
+        "⚙️ Admin": admin,
+    }
+
+    module = page_map.get(selected_page)
+    if module:
+        module.render()
+    else:
+        st.error("Page not found.")
+
+
+if __name__ == "__main__":
+    main()

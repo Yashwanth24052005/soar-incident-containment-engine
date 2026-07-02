@@ -1,5 +1,5 @@
 """
-Sidebar Component - Role-aware navigation sidebar.
+Sidebar Component - Polished role-aware navigation.
 """
 
 import streamlit as st
@@ -15,9 +15,15 @@ def render_sidebar() -> str:
 
     with st.sidebar:
         st.markdown("""
-        <div style='text-align:center; padding: 10px 0;'>
-            <h2>🛡️ SOAR Engine</h2>
-            <p style='color:#94a3b8; font-size:12px;'>Infotact Solutions & Co.</p>
+        <div style='padding: 20px 8px 16px;'>
+            <div style='display:flex; align-items:center; gap:10px;'>
+                <span style='font-size:28px;'>🛡️</span>
+                <div>
+                    <p style='margin:0; font-size:15px; font-weight:700;
+                              color:#f8fafc; letter-spacing:-0.02em;'>SOAR Engine</p>
+                    <p style='margin:0; font-size:11px; color:#475569;'>Infotact Solutions</p>
+                </div>
+            </div>
         </div>
         """, unsafe_allow_html=True)
 
@@ -26,28 +32,26 @@ def render_sidebar() -> str:
         badge = ROLE_BADGES.get(role, role)
         color = ROLE_COLORS.get(role, "#94a3b8")
         st.markdown(f"""
-        <div style='background:#1e2330; border:1px solid #2d3748;
-                    border-radius:8px; padding:12px; margin-bottom:12px;'>
-            <p style='margin:0; font-weight:600;'>{username}</p>
-            <p style='margin:0; color:{color}; font-size:12px;'>{badge}</p>
+        <div style='background:#141720; border:1px solid #1e2330;
+                    border-radius:10px; padding:12px 14px; margin-bottom:16px;'>
+            <p style='margin:0; font-size:13px; font-weight:600; color:#e2e8f0;'>@{username}</p>
+            <p style='margin:3px 0 0; font-size:11px; color:{color}; font-weight:500;'>{badge}</p>
         </div>
         """, unsafe_allow_html=True)
 
-        st.divider()
-        st.caption("NAVIGATION")
+        st.markdown("<p style='font-size:10px; font-weight:600; color:#334155; text-transform:uppercase; letter-spacing:0.12em; margin:0 0 8px;'>Navigation</p>", unsafe_allow_html=True)
+
         selected = st.radio("nav", pages, label_visibility="collapsed")
 
         st.divider()
+
         col1, col2 = st.columns(2)
         with col1:
-            if st.button("🔄 Refresh", use_container_width=True):
+            if st.button("↺ Refresh", use_container_width=True):
                 st.rerun()
         with col2:
-            if st.button("🚪 Logout", use_container_width=True):
+            if st.button("→ Logout", use_container_width=True):
                 logout()
                 st.rerun()
-
-        st.divider()
-        st.caption("v1.0.0 | Week 4")
 
     return selected

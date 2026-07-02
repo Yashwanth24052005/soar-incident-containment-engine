@@ -10,28 +10,17 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import streamlit as st
 from dashboard.auth import is_authenticated, show_login_page
 from dashboard.components.sidebar import render_sidebar
-from dashboard.pages import home, cases, incidents, playbooks, admin, analytics
+from dashboard.components.styles import GLOBAL_CSS
+from dashboard.pages import home, cases, incidents, analytics, playbooks, admin
 
 st.set_page_config(
-    page_title="SOAR Case Management Dashboard",
+    page_title="SOAR Engine — Dashboard",
     page_icon="🛡️",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-st.markdown("""
-<style>
-    .stButton > button {
-        background-color: #1d4ed8;
-        color: white;
-        border-radius: 8px;
-        border: none;
-    }
-    .stButton > button:hover {
-        background-color: #2563eb;
-    }
-</style>
-""", unsafe_allow_html=True)
+st.markdown(GLOBAL_CSS, unsafe_allow_html=True)
 
 
 def main():
@@ -42,12 +31,12 @@ def main():
     selected_page = render_sidebar()
 
     page_map = {
-        "🏠 Home": home,
-        "🚨 Cases": cases,
-        "📋 Incidents": incidents,
-        "📈 Analytics": analytics,
-        "🎯 Playbooks": playbooks,
-        "⚙️ Admin": admin,
+        "🏠 Home":       home,
+        "🚨 Cases":      cases,
+        "📋 Incidents":  incidents,
+        "📈 Analytics":  analytics,
+        "🎯 Playbooks":  playbooks,
+        "⚙️ Admin":      admin,
     }
 
     module = page_map.get(selected_page)

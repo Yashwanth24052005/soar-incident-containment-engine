@@ -3,10 +3,14 @@ SOAR Case Management Dashboard - Main Entry Point
 Week 4: Streamlit dashboard with RBAC-aware navigation.
 """
 
+import sys
+import os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import streamlit as st
 from dashboard.auth import is_authenticated, show_login_page
 from dashboard.components.sidebar import render_sidebar
-from dashboard.pages import home, cases, incidents, playbooks, admin
+from dashboard.pages import home, cases, incidents, playbooks, admin, analytics
 
 st.set_page_config(
     page_title="SOAR Case Management Dashboard",
@@ -41,6 +45,7 @@ def main():
         "🏠 Home": home,
         "🚨 Cases": cases,
         "📋 Incidents": incidents,
+        "📈 Analytics": analytics,
         "🎯 Playbooks": playbooks,
         "⚙️ Admin": admin,
     }
